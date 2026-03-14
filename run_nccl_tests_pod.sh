@@ -2,11 +2,11 @@
 set -euo pipefail
 
 # ====== 你可以改这些 ======
-IFNAMES=${IFNAMES:-"ib7s400p0,ib7s400p1,ib7s400p2,ib7s400p3,ib7s400p4,ib7s400p5,ib7s400p6,ib7s400p7"}
-IB_HCAS=${IB_HCAS:-"$IFNAMES"}
+IB_HCAS=${IB_HCAS:-"ib7s400p0,ib7s400p1,ib7s400p2,ib7s400p3,ib7s400p4,ib7s400p5,ib7s400p6,ib7s400p7"}
+SOCKET_IFNAMES=${SOCKET_IFNAMES:-"eth0"}
 # 多机时在 hosts 文件里写每行一个 hostname 或 IP（例如：node1、node2）
-#HOSTFILE=${HOSTFILE:-"./hosts"}
-HOSTFILE=${HOSTFILE:-"/etc/mpi/hostfile"}
+HOSTFILE=${HOSTFILE:-"./hosts"}
+#HOSTFILE=${HOSTFILE:-"/etc/mpi/hostfile"}
 # 每台机器 GPU 数（也可以不设，自动用 nvidia-smi 统计）
 GPUS_PER_NODE=${GPUS_PER_NODE:-""}
 
@@ -27,7 +27,7 @@ NCCL_TEST_BIN=./nccl-tests/build/all_reduce_perf_mpi
 # NCCL 环境
 export NCCL_DEBUG=${NCCL_DEBUG:-"INFO"}
 export NCCL_DEBUG_SUBSYS=${NCCL_DEBUG_SUBSYS:-"NET"}
-export NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-"$IFNAMES"}
+export NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-"$SOCKET_IFNAMES"}
 export NCCL_IB_HCA=${NCCL_IB_HCA:-"$IB_HCAS"}
 # 如需强制走 IB/RDMA，可取消下一行注释
 # export NCCL_IB_DISABLE=0
@@ -50,6 +50,30 @@ fi
 
 CURRENT_HOSTS=$(hostname -s 2>/dev/null || true)
 CURRENT_HOSTS+=" $(hostname 2>/dev/null || true) localhost 127.0.0.1"
+
+check_local_ifnames_exist() {
+  local csv=$1
+  local missing=()
+  local ifname
+
+  IFS=',' read -r -a ifnames <<< "$csv"
+  for ifname in "${ifnames[@]}"; do
+    ifname=${ifname//[[:space:]]/}
+    [ -n "$ifname" ] || continue
+    if ! ip link show "$ifname" >/dev/null 2>&1; then
+      missing+=("$ifname")
+    fi
+  done
+
+  if [ "${#missing[@]}" -gt 0 ]; then
+    echo "ERROR: NCCL socket interface(s) not found in this container: ${missing[*]}"
+    echo "Hint: in pods, NCCL bootstrap usually needs the pod network interface, e.g.:"
+    echo "  SOCKET_IFNAMES=eth0 ./run_nccl_tests_pod.sh"
+    exit 1
+  fi
+}
+
+check_local_ifnames_exist "$NCCL_SOCKET_IFNAME"
 
 if [ -z "$GPUS_PER_NODE" ]; then
   if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
@@ -108,12 +132,15 @@ print_perf_summary() {
 
     line=$(awk -v target="$target_bytes" '
       {
-        pattern = target "[[:space:]]+[0-9]+[[:space:]]+float[[:space:]]+sum[[:space:]]+-?[0-9]+([[:space:]]+[0-9.]+){8}"
-        if (match($0, pattern)) {
-          line = substr($0, RSTART, RLENGTH)
+        start = index($0, target)
+        if (start > 0) {
+          line = substr($0, start)
           gsub(/[[:space:]]+/, " ", line)
           sub(/^ /, "", line)
-          print line
+          n = split(line, fields, " ")
+          if (n >= 13 && fields[1] == target && fields[3] == "float" && fields[4] == "sum") {
+            print line
+          }
         }
       }
     ' "$log_file" | tail -n 1)
